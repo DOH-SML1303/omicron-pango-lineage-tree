@@ -7,7 +7,7 @@
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
 body { margin: 0; font-family: system-ui, sans-serif; background: white; color: #111827; }
-#toolbar { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #e5e7eb; background: rgba(255,255,255,0.96); }
+#toolbar { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #e5e7eb; background: rgba(255,255,255,0.96); }
 button { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; background: white; cursor: pointer; }
 button:hover { background: #f3f4f6; }
 #notice { padding: 8px 14px; font-size: 12px; background: #f8fafc; color: #334155; }
@@ -18,13 +18,24 @@ button:hover { background: #f3f4f6; }
 .node text { font-size: 12px; dominant-baseline: middle; cursor: pointer; }
 .link { fill: none; stroke: #cbd5e1; stroke-width: 1.2px; }
 .tooltip { position: fixed; pointer-events: none; opacity: 0; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; background: rgba(255,255,255,0.98); box-shadow: 0 4px 12px rgba(0,0,0,0.12); font-size: 12px; max-width: 520px; word-break: break-word; white-space: pre-line; }
+#lineage-search { padding: 6px 10px; width: 240px; border: 1px solid #d1d5db; border-radius: 6px; }
+#search-results { flex-basis: 100%; font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.node.search-match circle { fill: #facc15; stroke-width: 3px; }
+.node.search-match text { font-weight: 700; paint-order: stroke; stroke: #fef3c7; stroke-width: 4px; stroke-linejoin: round; }
 </style>
 </head>
 <body>
 <div id="toolbar">
 <strong>Omicron Pango lineage tree</strong>
+<form id="search-form" style="display:flex;gap:8px;align-items:center">
+<label for="lineage-search">Lineages</label>
+<input id="lineage-search" placeholder="XFG.6, SW.2" autocomplete="off">
+<button type="submit">Search</button>
+</form>
+<button id="clear-highlights">Clear highlights</button>
 <button id="collapse-all">Collapse all</button>
 <button id="reset-view">Reset view</button>
+<div id="search-results" aria-live="polite"></div>
 </div>
 <div id="notice">★ CDC-tracked variant &nbsp;&nbsp;|&nbsp;&nbsp; Recombinants (orange outline) are placed at the nearest shared ancestor of their listed parent segments. Dashed lines indicate display placement, not direct descent. Hover for the parent list.</div>
 <div id="tree"></div>
@@ -39,6 +50,10 @@ const dx = 26;
 const dy = 190;
 
 const root = d3.hierarchy(treeData);
+// Index the complete hierarchy before any branches are collapsed.
+const allNodes = root.descendants();
+const lineageIndex = new Map(allNodes.map(d => [d.data.name.toUpperCase(), d]));
+const highlighted = new Set();
 root.x0 = 0;
 root.y0 = 0;
 
@@ -71,7 +86,8 @@ const svg = d3.select("#tree").append("svg")
 const zoomLayer = svg.append("g");
 const linkLayer = zoomLayer.append("g");
 const nodeLayer = zoomLayer.append("g");
-svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", event => zoomLayer.attr("transform", event.transform)));
+const zoomBehavior = d3.zoom().scaleExtent([0.2, 4]).on("zoom", event => zoomLayer.attr("transform", event.transform));
+svg.call(zoomBehavior);
 
 const tooltip = d3.select("#tooltip");
 let nodeId = 0;
@@ -89,8 +105,9 @@ function update(source) {
   });
 
   const neededHeight = Math.max(height, right.x - left.x + margin.top + margin.bottom + 80);
-  svg.attr("height", neededHeight)
-    .attr("viewBox", [-margin.left, left.x - margin.top - 40, width, neededHeight]);
+  const neededWidth = Math.max(width, ...nodes.map(d => d.y + margin.left + margin.right));
+  svg.attr("width", neededWidth).attr("height", neededHeight)
+    .attr("viewBox", [-margin.left, left.x - margin.top - 40, neededWidth, neededHeight]);
 
   const node = nodeLayer.selectAll("g.node").data(nodes, d => d.id || (d.id = ++nodeId));
 
@@ -126,6 +143,7 @@ function update(source) {
     .text(d => d.data.cdc_tracked ? `${d.data.name} ★` : d.data.name);
 
   const nodeMerge = nodeEnter.merge(node);
+  nodeMerge.classed("search-match", d => highlighted.has(d.data.name));
   nodeMerge.transition().duration(duration).attr("transform", d => `translate(${d.y},${d.x})`);
   nodeMerge.select("circle").attr("fill", d => d._children ? "white" : "#4b5563");
   nodeMerge.select("text").attr("x", d => d._children ? -10 : 10).attr("text-anchor", d => d._children ? "end" : "start");
@@ -166,6 +184,73 @@ function collapseEverything() {
   }
   update(root);
 }
+
+function revealLineage(node) {
+  for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
+    if (!ancestor.children && ancestor._children) {
+      ancestor.children = ancestor._children;
+      ancestor._children = null;
+    }
+  }
+}
+
+function jumpToLineage(node) {
+  revealLineage(node);
+  svg.call(zoomBehavior.transform, d3.zoomIdentity);
+  update(root);
+  // Wait for layout animation, then use screen coordinates to respect zoom.
+  window.setTimeout(() => {
+    const element = nodeLayer.selectAll("g.node").filter(d => d === node).node();
+    if (!element) return;
+    const circle = element.querySelector("circle");
+    const bounds = circle.getBoundingClientRect();
+    const container = document.getElementById("tree");
+    const area = container.getBoundingClientRect();
+    container.scrollBy({
+      left: bounds.left + bounds.width / 2 - (area.left + area.width / 2),
+      top: bounds.top + bounds.height / 2 - (area.top + area.height / 2),
+      behavior: "smooth"
+    });
+  }, duration + 30);
+}
+
+function searchLineages(event) {
+  event.preventDefault();
+  const queries = [...new Set(document.getElementById("lineage-search").value
+    .split(",").map(value => value.trim().toUpperCase()).filter(Boolean))];
+  const results = document.getElementById("search-results");
+  results.replaceChildren();
+  if (!queries.length) {
+    results.textContent = "Enter one or more lineages, separated by commas.";
+    return;
+  }
+  const matches = [];
+  for (const query of queries) {
+    const node = lineageIndex.get(query);
+    if (node) {
+      revealLineage(node);
+      highlighted.add(node.data.name);
+      matches.push(node);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = node.data.name;
+      button.addEventListener("click", () => jumpToLineage(node));
+      results.appendChild(button);
+    } else {
+      const message = document.createElement("span");
+      message.textContent = `${query}: not found`;
+      results.appendChild(message);
+    }
+  }
+  update(root);
+  if (matches.length) jumpToLineage(matches[0]);
+}
+
+document.getElementById("search-form").addEventListener("submit", searchLineages);
+document.getElementById("clear-highlights").addEventListener("click", () => {
+  highlighted.clear();
+  update(root);
+});
 
 d3.select("#collapse-all").on("click", collapseEverything);
 d3.select("#reset-view").on("click", () => { resetTree(); update(root); });
